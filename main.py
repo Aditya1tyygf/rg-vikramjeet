@@ -31,7 +31,7 @@ HEADERS_TEMPLATE = {
     "Referer": "https://rankersgurukul.com/"
 }
 
-# --- Internal Helper for Protected Content ---
+# --- Shared Logic for Validation ---
 async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
@@ -60,19 +60,15 @@ async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
                 if res_json.get("status") == "success" or data_body:
                     return {"status": 200, "data": data_body or res_json}
     
-    raise HTTPException(status_code=403, detail="Access denied by all available tokens")
+    raise HTTPException(status_code=403, detail="Access denied")
 
 # --- Endpoints ---
-
-@router.get("/")
-def health():
-    return {"status": "RG-MAXX Proxy Online", "tokens": redis.scard("shared_tokens_pool")}
 
 @router.get("/all-batches")
 async def get_all_batches():
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
-        return {"status": 404, "data": []}
+        return {"status": 200, "data": []}
 
     master_list = []
     seen_ids = set()
@@ -90,24 +86,22 @@ async def get_all_batches():
         for r in results:
             if isinstance(r, httpx.Response) and r.status_code == 200:
                 for item in r.json().get("data", []):
-                    inner = {}
+                    # FILTER: Sirf Course wala data uthao, Test Series ko skip karo
                     if item.get("itemtype") == "Course" and item.get("coursedt"):
                         inner = item["coursedt"][0]
-                    elif item.get("itemtype") == "Test Series" and item.get("testseriesdt"):
-                        inner = item["testseriesdt"][0]
-                    else: continue
-
-                    batch_id = str(inner.get("id"))
-                    if batch_id not in seen_ids:
-                        master_list.append({
-                            "id": batch_id,
-                            "name": inner.get("course_name") or inner.get("title"),
-                            "thumbnail": inner.get("course_thumbnail") or inner.get("logo"),
-                            "type": item.get("itemtype"),
-                            "expiry": item.get("enddatetime")
-                        })
-                        seen_ids.add(batch_id)
-    return {"status": 200, "data": master_list}
+                        batch_id = str(inner.get("id"))
+                        
+                        if batch_id not in seen_ids:
+                            master_list.append({
+                                "id": batch_id,
+                                "name": inner.get("course_name"),
+                                "thumbnail": inner.get("course_thumbnail"),
+                                "type": "Course",
+                                "expiry": item.get("enddatetime")
+                            })
+                            seen_ids.add(batch_id)
+                            
+    return {"status": 200, "total": len(master_list), "data": master_list}
 
 @router.get("/get-subjects")
 async def get_subjects(courseid: str):
