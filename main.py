@@ -31,7 +31,7 @@ HEADERS_TEMPLATE = {
     "Referer": "https://rankersgurukul.com/"
 }
 
-# --- Smart Validator: Checks if token actually has access to the video ---
+# --- Shared Logic: Smart Token Picker ---
 async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
@@ -54,54 +54,83 @@ async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
 
         for i, resp in enumerate(results):
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                res_data = resp.json()
-                data_body = res_data.get("data")
+                res_json = resp.json()
+                data_body = res_json.get("data")
                 
-                # Agar video details mangi hain, toh check karo token khali toh nahi
+                # Check for Video Details: token khali nahi hona chahiye
                 if is_video:
                     v_token = data_body.get("video_player_token", "") if data_body else ""
                     if not v_token or len(v_token) < 10:
-                        continue # Token invalid hai, skip to next
+                        continue 
                 
-                # Agar data mil gaya (Subject/Topic/Valid Video)
-                if res_data.get("status") == "success" or data_body:
+                # Check for other data
+                if res_json.get("status") == "success" or data_body:
                     return {
                         "status": 200,
                         "provider_uid": uids[i],
-                        "data": data_body or res_data
+                        "data": data_body or res_json
                     }
     
-    raise HTTPException(status_code=403, detail="Access Denied: No valid purchase token found in pool")
+    raise HTTPException(status_code=403, detail="Batch not purchased or access denied by all tokens")
 
-# --- Final Endpoints ---
+# --- Endpoints ---
 
 @router.get("/")
 def health():
-    return {"status": "Proxy Active", "pool": redis.scard("shared_tokens_pool")}
+    return {"status": "Proxy Active", "pool_count": redis.scard("shared_tokens_pool")}
 
+# 1. Get All Batches (Merge results from all tokens)
+@router.get("/all-batches")
+async def get_all_batches():
+    all_tokens_raw = redis.smembers("shared_tokens_pool")
+    master_list = []
+    seen = set()
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        uids = []
+        for t_entry in all_tokens_raw:
+            data = json.loads(t_entry)
+            h = {**HEADERS_TEMPLATE, "Authorization": data['t']}
+            tasks.append(client.get(f"{BASE_URL}/get/get_all_purchases", headers=h, params={"userid": data['u']}))
+            uids.append(data['u'])
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, httpx.Response) and r.status_code == 200:
+                for b in r.json().get("data", []):
+                    bid = str(b.get("purchaseid") or b.get("id"))
+                    if bid not in seen:
+                        b["owner_uid"] = uids[i]
+                        master_list.append(b)
+                        seen.add(bid)
+    return {"status": 200, "data": master_list}
+
+# 2. Get Subjects
 @router.get("/get-subjects")
 async def get_subjects(courseid: str):
     return await fetch_smart_data("/get/allsubjectfrmlivecourseclass", {"courseid": courseid, "start": "-1"})
 
+# 3. Get Topics
 @router.get("/get-topics")
 async def get_topics(courseid: str, subjectid: str):
     return await fetch_smart_data("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
 
+# 4. Get Videos List
 @router.get("/get-videos")
 async def get_videos(courseid: str, subjectid: str, topicid: str):
     p = {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "1", "start": "0"}
     return await fetch_smart_data("/get/livecourseclassbycoursesubtopconceptapiv3", p)
 
+# 5. Get Video Details (Validated Token)
 @router.get("/get-video-details")
 async def get_video_details(course_id: str, video_id: str):
-    """Specially validated to ensure video_player_token is not empty"""
     p = {"course_id": course_id, "video_id": video_id, "ytflag": "0", "folder_wise_course": "0"}
     return await fetch_smart_data("/get/fetchVideoDetailsById", p, is_video=True)
 
+# 6. Add Token to Redis
 @router.api_route("/add-token", methods=["GET", "POST"])
 def add_token(token: str, userid: str):
     redis.sadd("shared_tokens_pool", json.dumps({"t": token, "u": userid}))
-    return {"status": "success"}
+    return {"status": "success", "message": f"Token saved for {userid}"}
 
-# Prefixing all routes with /api for Vercel consistency
 app.include_router(router, prefix="/api")
