@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 router = APIRouter()
 
+# CORS settings taaki frontend se error na aaye
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +32,7 @@ HEADERS_TEMPLATE = {
     "Referer": "https://rankersgurukul.com/"
 }
 
-# --- Shared Logic for Validation ---
+# --- Internal Helper for Video/Data Validation ---
 async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
@@ -60,15 +61,32 @@ async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
                 if res_json.get("status") == "success" or data_body:
                     return {"status": 200, "data": data_body or res_json}
     
-    raise HTTPException(status_code=403, detail="Access denied")
+    raise HTTPException(status_code=403, detail="Access denied by all available tokens")
 
 # --- Endpoints ---
 
+@router.get("/")
+def api_status():
+    """Check how many tokens are active in your pool"""
+    token_count = redis.scard("shared_tokens_pool")
+    return {
+        "status": "RG-MAXX Proxy Online", 
+        "total_tokens_in_pool": token_count,
+        "message": "Use /api/all-batches to see courses"
+    }
+
+@router.get("/clear-pool-secret-789")
+def clear_pool():
+    """Reset everything if batches are stuck"""
+    redis.delete("shared_tokens_pool")
+    return {"status": "success", "message": "Redis pool cleared. Now add fresh tokens."}
+
 @router.get("/all-batches")
 async def get_all_batches():
+    """Fetch ONLY Courses, No Test Series, No Owner UID"""
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
-        return {"status": 200, "data": []}
+        return {"status": 200, "total": 0, "data": []}
 
     master_list = []
     seen_ids = set()
@@ -79,18 +97,17 @@ async def get_all_batches():
             try:
                 data = json.loads(t_entry)
                 h = {**HEADERS_TEMPLATE, "Authorization": data['t']}
-                tasks.append(client.get(f"{BASE_URL}/get/get_all_purchases", headers=h, params={"userid": data['u']}))
+                tasks.append(client.get(f"{BASE_URL}/get/get_all_purchases", headers=h, params={"userid": data['u']}, timeout=10.0))
             except: continue
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, httpx.Response) and r.status_code == 200:
                 for item in r.json().get("data", []):
-                    # FILTER: Sirf Course wala data uthao, Test Series ko skip karo
+                    # Filter: Sirf 'Course' hona chahiye
                     if item.get("itemtype") == "Course" and item.get("coursedt"):
                         inner = item["coursedt"][0]
                         batch_id = str(inner.get("id"))
-                        
                         if batch_id not in seen_ids:
                             master_list.append({
                                 "id": batch_id,
@@ -100,7 +117,6 @@ async def get_all_batches():
                                 "expiry": item.get("enddatetime")
                             })
                             seen_ids.add(batch_id)
-                            
     return {"status": 200, "total": len(master_list), "data": master_list}
 
 @router.get("/get-subjects")
