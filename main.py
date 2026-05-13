@@ -31,7 +31,7 @@ HEADERS_TEMPLATE = {
     "Referer": "https://rankersgurukul.com/"
 }
 
-# --- Shared Logic: Smart Token Picker ---
+# --- Internal Helper for Protected Content ---
 async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
@@ -39,98 +39,97 @@ async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
 
     async with httpx.AsyncClient() as client:
         tasks = []
-        uids = []
-        
         for entry in all_tokens_raw:
             try:
                 data = json.loads(entry)
-                h = HEADERS_TEMPLATE.copy()
-                h.update({"Authorization": data['t']})
-                tasks.append(client.get(f"{BASE_URL}{endpoint}", headers=h, params=params, timeout=15.0))
-                uids.append(data['u'])
+                h = {**HEADERS_TEMPLATE, "Authorization": data['t']}
+                tasks.append(client.get(f"{BASE_URL}{endpoint}", headers=h, params=params, timeout=12.0))
             except: continue
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, resp in enumerate(results):
+        for resp in results:
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
                 res_json = resp.json()
                 data_body = res_json.get("data")
                 
-                # Check for Video Details: token khali nahi hona chahiye
                 if is_video:
                     v_token = data_body.get("video_player_token", "") if data_body else ""
                     if not v_token or len(v_token) < 10:
                         continue 
                 
-                # Check for other data
                 if res_json.get("status") == "success" or data_body:
-                    return {
-                        "status": 200,
-                        "provider_uid": uids[i],
-                        "data": data_body or res_json
-                    }
+                    return {"status": 200, "data": data_body or res_json}
     
-    raise HTTPException(status_code=403, detail="Batch not purchased or access denied by all tokens")
+    raise HTTPException(status_code=403, detail="Access denied by all available tokens")
 
 # --- Endpoints ---
 
 @router.get("/")
 def health():
-    return {"status": "Proxy Active", "pool_count": redis.scard("shared_tokens_pool")}
+    return {"status": "RG-MAXX Proxy Online", "tokens": redis.scard("shared_tokens_pool")}
 
-# 1. Get All Batches (Merge results from all tokens)
 @router.get("/all-batches")
 async def get_all_batches():
     all_tokens_raw = redis.smembers("shared_tokens_pool")
+    if not all_tokens_raw:
+        return {"status": 404, "data": []}
+
     master_list = []
-    seen = set()
+    seen_ids = set()
+
     async with httpx.AsyncClient() as client:
         tasks = []
-        uids = []
         for t_entry in all_tokens_raw:
-            data = json.loads(t_entry)
-            h = {**HEADERS_TEMPLATE, "Authorization": data['t']}
-            tasks.append(client.get(f"{BASE_URL}/get/get_all_purchases", headers=h, params={"userid": data['u']}))
-            uids.append(data['u'])
+            try:
+                data = json.loads(t_entry)
+                h = {**HEADERS_TEMPLATE, "Authorization": data['t']}
+                tasks.append(client.get(f"{BASE_URL}/get/get_all_purchases", headers=h, params={"userid": data['u']}))
+            except: continue
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, r in enumerate(results):
+        for r in results:
             if isinstance(r, httpx.Response) and r.status_code == 200:
-                for b in r.json().get("data", []):
-                    bid = str(b.get("purchaseid") or b.get("id"))
-                    if bid not in seen:
-                        b["owner_uid"] = uids[i]
-                        master_list.append(b)
-                        seen.add(bid)
+                for item in r.json().get("data", []):
+                    inner = {}
+                    if item.get("itemtype") == "Course" and item.get("coursedt"):
+                        inner = item["coursedt"][0]
+                    elif item.get("itemtype") == "Test Series" and item.get("testseriesdt"):
+                        inner = item["testseriesdt"][0]
+                    else: continue
+
+                    batch_id = str(inner.get("id"))
+                    if batch_id not in seen_ids:
+                        master_list.append({
+                            "id": batch_id,
+                            "name": inner.get("course_name") or inner.get("title"),
+                            "thumbnail": inner.get("course_thumbnail") or inner.get("logo"),
+                            "type": item.get("itemtype"),
+                            "expiry": item.get("enddatetime")
+                        })
+                        seen_ids.add(batch_id)
     return {"status": 200, "data": master_list}
 
-# 2. Get Subjects
 @router.get("/get-subjects")
 async def get_subjects(courseid: str):
     return await fetch_smart_data("/get/allsubjectfrmlivecourseclass", {"courseid": courseid, "start": "-1"})
 
-# 3. Get Topics
 @router.get("/get-topics")
 async def get_topics(courseid: str, subjectid: str):
     return await fetch_smart_data("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
 
-# 4. Get Videos List
 @router.get("/get-videos")
 async def get_videos(courseid: str, subjectid: str, topicid: str):
     p = {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "1", "start": "0"}
     return await fetch_smart_data("/get/livecourseclassbycoursesubtopconceptapiv3", p)
 
-# 5. Get Video Details (Validated Token)
 @router.get("/get-video-details")
 async def get_video_details(course_id: str, video_id: str):
     p = {"course_id": course_id, "video_id": video_id, "ytflag": "0", "folder_wise_course": "0"}
     return await fetch_smart_data("/get/fetchVideoDetailsById", p, is_video=True)
 
-# 6. Add Token to Redis
 @router.api_route("/add-token", methods=["GET", "POST"])
 def add_token(token: str, userid: str):
     redis.sadd("shared_tokens_pool", json.dumps({"t": token, "u": userid}))
-    return {"status": "success", "message": f"Token saved for {userid}"}
+    return {"status": "success"}
 
 app.include_router(router, prefix="/api")
