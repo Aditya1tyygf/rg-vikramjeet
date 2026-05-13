@@ -15,8 +15,8 @@ app.add_middleware(
 )
 
 # Redis Setup
-REDIS_URL = os.getenv("REDIS_URL", "https://winning-lioness-97755.upstash.io")
-REDIS_TOKEN = os.getenv("REDIS_TOKEN", "gQAAAAAAAX3bAAIgcDExMDY4NGY2OWZlZGY0OWY0ODA0NmNmZDNlM2JhNGUxOA")
+REDIS_URL = os.getenv("REDIS_URL", "https://allowing-kite-91500.upstash.io")
+REDIS_TOKEN = os.getenv("REDIS_TOKEN", "gQAAAAAAAWVsAAIgcDJmNmE5NTg1NWM5NzM0M2NkYTg5NjkxZWViYjhjOGU5Ng")
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 
 BASE_URL = "https://rgvikramjeetapi.classx.co.in"
