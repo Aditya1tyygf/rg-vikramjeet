@@ -1,13 +1,13 @@
 import json
 import asyncio
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, APIRouter
 from upstash_redis import Redis
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+router = APIRouter()
 
-# CORS settings taki frontend se access block na ho
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,12 +31,11 @@ HEADERS_TEMPLATE = {
     "Referer": "https://rankersgurukul.com/"
 }
 
-# --- Shared Logic: Token Pool Scanner ---
-async def fetch_from_pool(endpoint: str, params: dict):
-    # Redis se saare tokens uthao
+# --- Smart Validator: Checks if token actually has access to the video ---
+async def fetch_smart_data(endpoint: str, params: dict, is_video: bool = False):
     all_tokens_raw = redis.smembers("shared_tokens_pool")
     if not all_tokens_raw:
-        raise HTTPException(status_code=404, detail="Redis pool is empty. Add tokens first.")
+        raise HTTPException(status_code=404, detail="No tokens in pool")
 
     async with httpx.AsyncClient() as client:
         tasks = []
@@ -44,66 +43,65 @@ async def fetch_from_pool(endpoint: str, params: dict):
         
         for entry in all_tokens_raw:
             try:
-                token_data = json.loads(entry)
-                t = token_data.get('t')
-                u = token_data.get('u')
-                
+                data = json.loads(entry)
                 h = HEADERS_TEMPLATE.copy()
-                h.update({"Authorization": t})
-                
-                # Request prepare karo
-                tasks.append(client.get(f"{BASE_URL}{endpoint}", headers=h, params=params, timeout=10.0))
-                uids.append(u)
-            except:
-                continue
+                h.update({"Authorization": data['t']})
+                tasks.append(client.get(f"{BASE_URL}{endpoint}", headers=h, params=params, timeout=15.0))
+                uids.append(data['u'])
+            except: continue
 
-        # Saari requests ek saath parallel chalao
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Check karo kaunsa token kaam kar gaya
         for i, resp in enumerate(results):
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                res_json = resp.json()
-                # Agar ClassX ne valid data diya hai
-                if res_json.get("status") == "success" or res_json.get("data"):
+                res_data = resp.json()
+                data_body = res_data.get("data")
+                
+                # Agar video details mangi hain, toh check karo token khali toh nahi
+                if is_video:
+                    v_token = data_body.get("video_player_token", "") if data_body else ""
+                    if not v_token or len(v_token) < 10:
+                        continue # Token invalid hai, skip to next
+                
+                # Agar data mil gaya (Subject/Topic/Valid Video)
+                if res_data.get("status") == "success" or data_body:
                     return {
                         "status": 200,
                         "provider_uid": uids[i],
-                        "data": res_json.get("data") or res_json
+                        "data": data_body or res_data
                     }
+    
+    raise HTTPException(status_code=403, detail="Access Denied: No valid purchase token found in pool")
 
-    raise HTTPException(status_code=403, detail="Batch not accessible with available tokens.")
+# --- Final Endpoints ---
 
-# --- Endpoints ---
+@router.get("/")
+def health():
+    return {"status": "Proxy Active", "pool": redis.scard("shared_tokens_pool")}
 
-@app.get("/")
-def health_check():
-    return {"status": "Proxy Running", "tokens_in_pool": redis.scard("shared_tokens_pool")}
+@router.get("/get-subjects")
+async def get_subjects(courseid: str):
+    return await fetch_smart_data("/get/allsubjectfrmlivecourseclass", {"courseid": courseid, "start": "-1"})
 
-@app.get("/api/get-subjects")
-async def get_subjects(courseid: str = Query(...)):
-    """Automatic token pick karke subjects dikhayega"""
-    return await fetch_from_pool("/get/allsubjectfrmlivecourseclass", {"courseid": courseid, "start": "-1"})
+@router.get("/get-topics")
+async def get_topics(courseid: str, subjectid: str):
+    return await fetch_smart_data("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
 
-@app.get("/api/get-topics")
-async def get_topics(courseid: str = Query(...), subjectid: str = Query(...)):
-    """Automatic token pick karke topics dikhayega"""
-    return await fetch_from_pool("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
-
-@app.get("/api/get-videos")
+@router.get("/get-videos")
 async def get_videos(courseid: str, subjectid: str, topicid: str):
-    """Automatic token pick karke videos dikhayega"""
-    params = {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "1", "start": "0"}
-    return await fetch_from_pool("/get/livecourseclassbycoursesubtopconceptapiv3", params)
+    p = {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "1", "start": "0"}
+    return await fetch_smart_data("/get/livecourseclassbycoursesubtopconceptapiv3", p)
 
-@app.get("/api/get-video-details")
+@router.get("/get-video-details")
 async def get_video_details(course_id: str, video_id: str):
-    """Automatic token pick karke stream URL nikalega"""
-    params = {"course_id": course_id, "video_id": video_id, "ytflag": "0", "folder_wise_course": "0"}
-    return await fetch_from_pool("/get/fetchVideoDetailsById", params)
+    """Specially validated to ensure video_player_token is not empty"""
+    p = {"course_id": course_id, "video_id": video_id, "ytflag": "0", "folder_wise_course": "0"}
+    return await fetch_smart_data("/get/fetchVideoDetailsById", p, is_video=True)
 
-@app.api_route("/api/add-token", methods=["GET", "POST"])
+@router.api_route("/add-token", methods=["GET", "POST"])
 def add_token(token: str, userid: str):
-    token_entry = json.dumps({"t": token, "u": userid})
-    redis.sadd("shared_tokens_pool", token_entry)
-    return {"status": "success", "message": f"Token saved for UID {userid}"}
+    redis.sadd("shared_tokens_pool", json.dumps({"t": token, "u": userid}))
+    return {"status": "success"}
+
+# Prefixing all routes with /api for Vercel consistency
+app.include_router(router, prefix="/api")
